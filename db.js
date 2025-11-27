@@ -23,7 +23,7 @@ function generateRandomCode(length = 6) {
  */
 export async function initializeDb() {
     try {
-        // 1. Tabla USERS
+        // 1. Tabla USERS: Se eliminaron temp_otp y otp_expires_at
         await client.execute(`
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -40,8 +40,6 @@ export async function initializeDb() {
                 is_approved INTEGER DEFAULT 1,
                 referred_by_user_id INTEGER DEFAULT NULL,
                 premium_expires_at DATETIME DEFAULT NULL,
-                temp_otp TEXT DEFAULT NULL,             -- 🟢 AÑADIDO para el token de email
-                otp_expires_at DATETIME DEFAULT NULL,   -- 🟢 AÑADIDO para la expiración del token
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
         `);
@@ -113,17 +111,6 @@ export async function initializeDb() {
             );
         `);
         console.log("✅ Database: 'transaction_logs' table ready.");
-
-        // 🟢 MIGRACIÓN AUTOMÁTICA: Asegurar que las columnas existan si la tabla ya estaba creada
-        try {
-            await client.execute("ALTER TABLE users ADD COLUMN temp_otp TEXT DEFAULT NULL");
-            console.log("✅ Columna 'temp_otp' agregada a la tabla users.");
-        } catch (err) {}
-        try {
-            await client.execute("ALTER TABLE users ADD COLUMN otp_expires_at DATETIME DEFAULT NULL");
-            console.log("✅ Columna 'otp_expires_at' agregada a la tabla users.");
-        } catch (err) {}
-
 
     } catch (error) {
         console.error("❌ Error initializing database:", error);

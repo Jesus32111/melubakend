@@ -5,7 +5,6 @@ import 'dotenv/config';
 import { client, initializeDb, seedAdminUser, assignReferralCodesToExistingUsers } from './db.js';
 import http from 'http';
 import { Server } from 'socket.io';
-import nodemailer from 'nodemailer';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -13,41 +12,6 @@ const PORT = process.env.PORT || 3001;
 // 🔑 Crear servidor HTTP para Express y Socket.io
 const httpServer = http.createServer(app);
 
-const transporter = nodemailer.createTransport({
-    host: 'smtp.gmail.com',
-    port: 587,
-    secure: false,
-    auth: {
-        // 🟢 Utiliza las variables del .env para el envío
-        user: process.env.EMAIL_USER,
-        pass: process.env.EMAIL_PASS,
-    },
-});
-
-const ADMIN_TOKEN_RECIPIENT = 'jesisfarid@gmail.com';
-
-
-async function sendVerificationEmail(toEmail, token) {
-    const mailOptions = {
-        from: process.env.EMAIL_USER,
-        to: toEmail, // 🟢 El receptor es 'jesisfarid@gmail.com'
-        subject: 'Código de Verificación de Acceso - Melu Admin',
-        html: `<div style="font-family: Arial, sans-serif; padding: 20px; border: 1px solid #ddd; border-radius: 8px; background-color: #f7f7f7;">
-               <p style="font-size: 16px; color: #333;">Hola Administrador,</p>
-               <p style="color: #333;">Tu código de verificación de acceso es:</p>
-               <h1 style="color: #9E7FFF; font-size: 36px; margin: 15px 0; background-color: #fff; padding: 10px; border-radius: 5px; text-align: center;"><strong>${token}</strong></h1>
-               <p style="font-size: 14px; color: #333;">Este código caduca en 5 minutos. Por favor, ingrésalo en la ventana de inicio de sesión.</p>
-               </div>`,
-    };
-
-    try {
-        await transporter.sendMail(mailOptions);
-        console.log(`✅ Email enviado exitosamente a ${toEmail} desde ${process.env.EMAIL_USER}`);
-    } catch (error) {
-        console.error('❌ Error CRÍTICO al enviar el correo de token:', error);
-        throw new Error('Fallo al enviar el correo de verificación.'); 
-    }
-}
 
 // 🔑 Configuración de CORS dinámica
 const corsOriginsString = process.env.CORS_ALLOWED_ORIGINS || 'http://localhost:5173';
@@ -489,36 +453,6 @@ app.post('/login', async (req, res) => {
         }
 
         // 🟢 LÓGICA DE VERIFICACIÓN POR EMAIL (Solo para Admin)
-        if (user.role === 'Admin') {
-            const token = Math.floor(100000 + Math.random() * 900000).toString(); // Token de 6 dígitos
-            const expirationTime = new Date(Date.now() + 5 * 60000); // 5 minutos de caducidad
-            const formattedExpiration = expirationTime.toISOString().replace('T', ' ').substring(0, 19);
-
-            // 1. Guardar el token en la DB
-            await client.execute({
-                sql: "UPDATE users SET temp_otp = ?, otp_expires_at = ? WHERE id = ?",
-                args: [token, formattedExpiration, user.id]
-            });
-            
-            // 2. Enviar el correo electrónico real al receptor FIJO
-            try {
-                await sendVerificationEmail(ADMIN_TOKEN_RECIPIENT, token); 
-            } catch (emailError) {
-                // Si falla el envío, limpiamos el token de la DB y reportamos el error
-                await client.execute({ sql: "UPDATE users SET temp_otp = NULL, otp_expires_at = NULL WHERE id = ?", args: [user.id] });
-                return res.status(500).json({ message: 'Error al enviar el correo de verificación. Revisa la configuración SMTP.' });
-            }
-
-            // 3. Informar al frontend que la verificación es necesaria
-            return res.status(202).json({ 
-                // Mensaje al usuario indicando a dónde se envió
-                message: `Se ha enviado un código de validación de 6 dígitos al correo ${ADMIN_TOKEN_RECIPIENT}. Por favor, ingrésalo para continuar.`,
-                requiresEmailVerification: true,
-                adminEmail: user.email // Se usa este email para el endpoint /verify-email-token
-            });
-        }
-        // 🟢 FIN LÓGICA DE VERIFICACIÓN POR EMAIL
-
         // 🟢 LÓGICA NORMAL DE LOGIN (No admin)
         const currentRole = await checkAndExpirePremium(user);
 
@@ -538,57 +472,6 @@ app.post('/login', async (req, res) => {
     }
 });
 
-app.post('/admin/verify-email-token', async (req, res) => {
-    const { email, token } = req.body;
-
-    if (!email || !token) {
-        return res.status(400).json({ message: 'Correo electrónico y código son obligatorios.' });
-    }
-
-    try {
-        // Buscamos usuario por email y rol 'Admin'
-        const userResult = await client.execute({
-            sql: 'SELECT id, username, email, role, temp_otp, otp_expires_at FROM users WHERE email = ? AND role = ?',
-            args: [email, 'Admin']
-        });
-
-        if (userResult.rows.length === 0) {
-            return res.status(404).json({ message: 'Usuario administrador no encontrado.' });
-        }
-
-        const user = userResult.rows[0];
-        const now = new Date();
-        const expiresAt = user.otp_expires_at ? new Date(user.otp_expires_at) : null;
-
-        // 1. Verificar el token y la expiración
-        if (user.temp_otp !== token) {
-            return res.status(401).json({ message: 'Código de validación incorrecto.' });
-        }
-        if (!expiresAt || now > expiresAt) {
-            // Limpiamos el token expirado por seguridad
-            await client.execute({ sql: "UPDATE users SET temp_otp = NULL, otp_expires_at = NULL WHERE id = ?", args: [user.id] });
-            return res.status(401).json({ message: 'Código de validación expirado. Intenta iniciar sesión de nuevo.' });
-        }
-
-        // 2. Éxito: Limpiar el token de la DB
-        await client.execute({ sql: "UPDATE users SET temp_otp = NULL, otp_expires_at = NULL WHERE id = ?", args: [user.id] });
-
-        // 3. Devolver la respuesta de éxito (como si fuera el login final)
-        res.status(200).json({
-            message: 'Verificación exitosa. Acceso de Administrador concedido.',
-            user: {
-                id: user.id,
-                username: user.username,
-                email: user.email,
-                role: user.role,
-            }
-        });
-
-    } catch (error) {
-        console.error('Admin token verification error:', error);
-        res.status(500).json({ message: 'Error interno del servidor durante la verificación.' });
-    }
-});
 
 // 🔑 NUEVO ENDPOINT: Enviar transacción a Soporte
 app.post('/user/send-to-support', async (req, res) => {
