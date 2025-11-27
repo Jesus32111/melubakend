@@ -15,8 +15,8 @@ const httpServer = http.createServer(app);
 
 const transporter = nodemailer.createTransport({
     host: 'smtp.gmail.com',
-    port: 465,
-    secure: true,
+    port: 587,
+    secure: false,
     auth: {
         // 🟢 Utiliza las variables del .env para el envío
         user: process.env.EMAIL_USER,
