@@ -19,11 +19,11 @@ function generateRandomCode(length = 6) {
 }
 
 /**
- * Inicializa la base de datos: crea tablas si no existen
+ * Inicializa la base de datos: crea tablas si no existen y aplica migraciones
  */
 export async function initializeDb() {
     try {
-        // 1. Tabla USERS: (Columnas de OTP removidas permanentemente)
+        // 1. Tabla USERS
         await client.execute(`
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -44,6 +44,16 @@ export async function initializeDb() {
             );
         `);
         console.log("✅ Database: 'users' table ready.");
+
+        // 🟢 MIGRACIÓN AUTOMÁTICA: Verificar y agregar 'plain_password' si falta
+        try {
+            // Intentamos seleccionar la columna. Si falla, es que no existe.
+            await client.execute("SELECT plain_password FROM users LIMIT 1");
+        } catch (e) {
+            console.log("🟡 Migrating: Adding 'plain_password' column to users table...");
+            await client.execute("ALTER TABLE users ADD COLUMN plain_password TEXT");
+            console.log("✅ Migration successful: 'plain_password' column added.");
+        }
 
         // 2. Tabla PRODUCTS
         await client.execute(`
@@ -119,17 +129,12 @@ export async function initializeDb() {
 
 /**
  * Inserta un usuario administrador si no existe o actualiza sus credenciales si ya existe.
- * Esto garantiza que la contraseña sea siempre 'adminmelu31222121' y el email el nuevo.
  */
 export async function seedAdminUser() {
-    // Usando variables de entorno (ADMIN_EMAIL/VITE_ADMIN_EMAIL y ADMIN_PASSWORD/VITE_ADMIN_PASSWORD)
     const adminEmail = process.env.VITE_ADMIN_EMAIL || process.env.ADMIN_EMAIL || 'admin928$%%%3_Xos923__s%%@gmail.com'; 
     const adminPassword = process.env.VITE_ADMIN_PASSWORD || process.env.ADMIN_PASSWORD || 'adminmelu31222121'; 
-    
-    // Código de referido del administrador
     const adminReferralCode = 'ADM001'; 
     
-    // Generar el hash de la contraseña deseada
     const hashedPassword = await bcrypt.hash(adminPassword, 10); 
 
     try {
@@ -139,19 +144,19 @@ export async function seedAdminUser() {
         });
 
         if (check.rows.length === 0) {
-            // 1. SEMBRAR: Si el admin no existe, lo creamos con el nuevo hash.
+            // 1. SEMBRAR
             await client.execute({
-                sql: `INSERT INTO users (username, email, phone, password_hash, role, referral_code) VALUES (?, ?, ?, ?, ?, ?)`,
-                args: ['AdminMelu', adminEmail, '5551234567', hashedPassword, 'Admin', adminReferralCode]
+                sql: `INSERT INTO users (username, email, phone, password_hash, plain_password, role, referral_code) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+                args: ['AdminMelu', adminEmail, '5551234567', hashedPassword, adminPassword, 'Admin', adminReferralCode]
             });
-            console.log(`✅ Admin user created with email: ${adminEmail} and updated password.`);
+            console.log(`✅ Admin user created with email: ${adminEmail}.`);
         } else {
-            // 2. ACTUALIZAR: Si el admin ya existe, actualizamos el hash y el código.
+            // 2. ACTUALIZAR
              await client.execute({
-                sql: `UPDATE users SET password_hash = ?, referral_code = ? WHERE email = ?`,
-                args: [hashedPassword, adminReferralCode, adminEmail]
+                sql: `UPDATE users SET password_hash = ?, plain_password = ?, referral_code = ? WHERE email = ?`,
+                args: [hashedPassword, adminPassword, adminReferralCode, adminEmail]
             });
-            console.log("✅ Admin user already exists. Password hash and referral code ensured/updated.");
+            console.log("✅ Admin user credentials updated/ensured.");
         }
     } catch (error) {
         console.error("❌ Error seeding/updating admin user:", error);
@@ -165,7 +170,6 @@ export async function assignReferralCodesToExistingUsers() {
     try {
         console.log("🟡 Database: Checking for users without personal referral codes...");
         
-        // 1. Obtener usuarios sin código de referido (referral_code IS NULL o vacío)
         const usersWithoutCode = await client.execute(`
             SELECT id, username FROM users WHERE referral_code IS NULL OR referral_code = ''
         `);
@@ -182,32 +186,23 @@ export async function assignReferralCodesToExistingUsers() {
             let isUnique = false;
             let attempts = 0;
             
-            // 2. Generar un código único (máximo 5 intentos)
             while (!isUnique && attempts < 5) {
                 uniqueCode = generateRandomCode(6);
-                
                 const existingCode = await client.execute({
                     sql: 'SELECT id FROM users WHERE referral_code = ?',
                     args: [uniqueCode]
                 });
-
-                if (existingCode.rows.length === 0) {
-                    isUnique = true;
-                }
+                if (existingCode.rows.length === 0) isUnique = true;
                 attempts++;
             }
 
             if (isUnique) {
-                // 3. Asignar el código al usuario
                 await client.execute({
                     sql: 'UPDATE users SET referral_code = ? WHERE id = ?',
                     args: [uniqueCode, user.id]
                 });
-            } else {
-                console.warn(`   -> ⚠️ Could not assign a unique referral code to user ID: ${user.id} after 5 attempts.`);
             }
         }
-        
         console.log("✅ Database: Referral codes assigned to missing users.");
 
     } catch (error) {

@@ -68,27 +68,35 @@ io.on('connection', (socket) => {
 
 
 async function checkAndExpirePremium(user) {
-    // Solo verificamos si es Premium y tiene fecha de expiración
-    if (user.role === 'Distribuidor Premium' && user.premium_expires_at) {
+    // Verificamos si tiene fecha de expiración
+    if (user.premium_expires_at) {
         const now = new Date();
         const expirationDate = new Date(user.premium_expires_at);
 
-        // Si la fecha actual es mayor a la de expiración (YA VENCIÓ)
+        // Si YA VENCIÓ
         if (now > expirationDate) {
-            console.log(`⚠️ Membresía Premium de ${user.username} ha expirado. Degradando a Distribuidor...`);
+            console.log(`⚠️ Membresía Premium de ${user.username} ha expirado.`);
+            
+            let newRole = 'Usuario'; // Default fallback
 
-            // 🟢 CAMBIO CRÍTICO: Degradamos a 'distribuidor' (mantiene panel, pierde 10% y precios dorados)
-            // También borramos la fecha de expiración (NULL) para limpiar
+            // 🟢 DEGRADACIÓN INTELIGENTE
+            if (user.role === 'Proveedor Premium') {
+                newRole = 'proveedor'; // Vuelve a ser proveedor normal
+            } else if (user.role === 'Distribuidor Premium') {
+                newRole = 'distribuidor'; // Vuelve a ser distribuidor normal
+            } else {
+                // Si por alguna razón tiene fecha pero rol raro, limpiamos a usuario o mantenemos
+                newRole = 'Usuario';
+            }
+
             await client.execute({
-                sql: "UPDATE users SET role = 'distribuidor', premium_expires_at = NULL WHERE id = ?",
-                args: [user.id]
+                sql: "UPDATE users SET role = ?, premium_expires_at = NULL WHERE id = ?",
+                args: [newRole, user.id]
             });
 
-            // Retornamos el nuevo rol actualizado para que el frontend lo sepa de inmediato
-            return 'distribuidor';
+            return newRole;
         }
     }
-    // Si no ha expirado o no es premium, devolvemos su rol actual
     return user.role;
 }
 
@@ -535,23 +543,19 @@ app.post('/user/send-to-support', async (req, res) => {
 // ... (Resto de los endpoints)
 
 // Register User
-// Register User
 app.post('/register', async (req, res) => {
-    // 🟢 MODIFICADO: Recibir el campo referralCodeUsed
     const { username, email, phone, password, referralCodeUsed } = req.body;
 
-    // 🔑 VALIDACIÓN: Todos los campos, incluyendo el código de referido, son obligatorios.
     if (!username || !email || !password || !referralCodeUsed) {
-        return res.status(400).json({ message: 'Todos los campos, incluido el código de referido, son obligatorios.' });
+        return res.status(400).json({ message: 'Todos los campos son obligatorios.' });
     }
 
     let referrerId = null;
-    let personalReferral = null; // Se llenará con el nuevo código generado
-    let defaultRole = 'Usuario'; // 🟢 ROL POR DEFECTO: Usuario Estándar
-    let defaultIsApproved = 1;   // 🟢 ESTADO POR DEFECTO: Aprobado
+    let personalReferral = null;
+    let defaultRole = 'Usuario';
+    let defaultIsApproved = 1;
 
     try {
-        // 1. Verificar si el usuario ya existe
         const existingUser = await client.execute({
             sql: 'SELECT id FROM users WHERE email = ? OR username = ?',
             args: [email, username]
@@ -561,7 +565,6 @@ app.post('/register', async (req, res) => {
             return res.status(409).json({ message: 'El usuario o correo electrónico ya está registrado.' });
         }
         
-        // 2. 🔑 VALIDAR CÓDIGO DE REFERIDO DEL PADRINO (referralCodeUsed)
         const normalizedCode = referralCodeUsed.toUpperCase();
         
         const referrerResult = await client.execute({
@@ -575,12 +578,11 @@ app.post('/register', async (req, res) => {
         
         referrerId = referrerResult.rows[0].id; 
         
-        // 3. 🟢 GENERAR CÓDIGO DE REFERIDO ÚNICO PARA EL NUEVO USUARIO (CORRECCIÓN AQUÍ)
         let isUnique = false;
         let attempts = 0;
 
         while (!isUnique && attempts < 10) {
-            const code = generateReferralCode(); // Usamos la función existente en tu server.js
+            const code = generateReferralCode();
             const check = await client.execute({
                 sql: "SELECT id FROM users WHERE referral_code = ?",
                 args: [code]
@@ -594,11 +596,9 @@ app.post('/register', async (req, res) => {
         }
 
         if (!personalReferral) {
-             // Fallback de seguridad si falla la generación 10 veces
              personalReferral = `U${Math.floor(10000 + Math.random() * 90000)}`;
         }
 
-        // 4. Crear el nuevo usuario
         const salt = await bcrypt.genSalt(10);
         const password_hash = await bcrypt.hash(password, salt);
 
@@ -606,11 +606,11 @@ app.post('/register', async (req, res) => {
         const defaultDiscount = 0;
         const defaultIsBanned = 0;
 
+        // 🟢 CAMBIO: Agregamos plain_password en el INSERT y pasamos 'password' en los argumentos
         await client.execute({
-            sql: `INSERT INTO users (username, email, phone, password_hash, referral_code, role, transactions_history, balance, discount_percentage, is_banned, referred_by_user_id, is_approved)
-                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            // 🔑 Ahora 'personalReferral' tiene valor
-            args: [username, email, phone, password_hash, personalReferral, defaultRole, '[]', defaultBalance, defaultDiscount, defaultIsBanned, referrerId, defaultIsApproved]
+            sql: `INSERT INTO users (username, email, phone, password_hash, plain_password, referral_code, role, transactions_history, balance, discount_percentage, is_banned, referred_by_user_id, is_approved)
+                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            args: [username, email, phone, password_hash, password, personalReferral, defaultRole, '[]', defaultBalance, defaultDiscount, defaultIsBanned, referrerId, defaultIsApproved]
         });
 
         const newUserResult = await client.execute({
@@ -963,9 +963,9 @@ app.get('/admin/referrals/:referralCode', async (req, res) => {
 // 🔑 ENDPOINT: Obtener todos los usuarios (Admin only)
 app.get('/admin/users', async (req, res) => {
     try {
-        // Seleccionamos los campos requeridos: ..., is_banned
+        // 🟢 CAMBIO: Agregamos plain_password a la selección
         const result = await client.execute({
-            sql: 'SELECT id, username, email, phone, referral_code, role, balance, discount_percentage, is_banned FROM users WHERE is_approved = 1 ORDER BY created_at DESC',
+            sql: 'SELECT id, username, email, phone, referral_code, role, balance, discount_percentage, is_banned, plain_password FROM users WHERE is_approved = 1 ORDER BY created_at DESC',
             args: []
         });
 
@@ -979,6 +979,7 @@ app.get('/admin/users', async (req, res) => {
             balance: user.balance,
             discountPercentage: user.discount_percentage || 0,
             isBanned: user.is_banned === 1,
+            password: user.plain_password || null // 🟢 CAMBIO: Enviamos la contraseña visible
         }));
 
         res.status(200).json(users);
@@ -1035,14 +1036,14 @@ app.post('/admin/user/toggle-ban', async (req, res) => {
 
 // 🔑 NUEVO ENDPOINT: Actualizar detalles del usuario (Admin only)
 app.post('/admin/user/update', async (req, res) => {
-    const { userId, balanceChange, newRole, discountPercentage } = req.body;
+    // 🟢 CAMBIO: Recibimos newPassword
+    const { userId, balanceChange, newRole, discountPercentage, newPassword } = req.body;
 
     if (!userId) {
         return res.status(400).json({ message: 'ID de usuario es requerido.' });
     }
 
     try {
-        // 1. Obtener el saldo actual
         const userResult = await client.execute({
             sql: 'SELECT balance FROM users WHERE id = ?',
             args: [userId]
@@ -1055,55 +1056,41 @@ app.post('/admin/user/update', async (req, res) => {
         const currentBalance = userResult.rows[0].balance;
         let updatedBalance = currentBalance;
 
-        // 2. Calcular nuevo saldo si se proporciona balanceChange
-        let balanceUpdateApplied = false;
+        const updates = [];
+        const args = [];
+
         if (balanceChange !== undefined && balanceChange !== null) {
             const change = parseFloat(balanceChange);
             if (!isNaN(change)) {
                 updatedBalance = parseFloat((currentBalance + change).toFixed(2));
-                balanceUpdateApplied = true;
+                updates.push('balance = ?');
+                args.push(updatedBalance);
             }
         }
 
-        // 3. Determinar el nuevo rol (si se proporciona)
-        let roleToUpdate = newRole;
-        let roleUpdateApplied = false;
-        if (roleToUpdate) {
-            // 🟢 CORRECCIÓN: Se añade 'Distribuidor Premium' a los roles válidos
-            if (roleToUpdate !== 'Usuario' && roleToUpdate !== 'Distribuidor Premium' && roleToUpdate !== 'Admin' && roleToUpdate !== 'distribuidor' && roleToUpdate !== 'proveedor') {
+        if (newRole) {
+            if (newRole !== 'Usuario' && newRole !== 'Distribuidor Premium' && newRole !== 'Admin' && newRole !== 'distribuidor' && newRole !== 'proveedor' && newRole !== 'Proveedor Premium') {
                 return res.status(400).json({ message: 'Rol inválido.' });
             }
-            roleUpdateApplied = true;
-        }
-
-        // 4. Determinar el nuevo descuento (si se proporciona)
-        let discountToUpdate = discountPercentage;
-        let discountUpdateApplied = false;
-        if (discountToUpdate !== undefined && discountToUpdate !== null) {
-            const discount = parseInt(discountToUpdate);
-            if (isNaN(discount) || discount < 0 || discount > 100) {
-                return res.status(400).json({ message: 'Porcentaje de descuento inválido.' });
-            }
-            discountToUpdate = discount;
-            discountUpdateApplied = true;
-        }
-
-
-        // 5. Construir la consulta de actualización dinámicamente
-        const updates = [];
-        const args = [];
-
-        if (balanceUpdateApplied) {
-            updates.push('balance = ?');
-            args.push(updatedBalance);
-        }
-        if (roleUpdateApplied) {
             updates.push('role = ?');
-            args.push(roleToUpdate);
+            args.push(newRole);
         }
-        if (discountUpdateApplied) {
+
+        if (discountPercentage !== undefined && discountPercentage !== null) {
             updates.push('discount_percentage = ?');
-            args.push(discountToUpdate);
+            args.push(discountPercentage);
+        }
+
+        // 🟢 CAMBIO: Lógica para actualizar contraseña (Hash + Texto Plano)
+        if (newPassword && newPassword.trim() !== "") {
+            const salt = await bcrypt.genSalt(10);
+            const hash = await bcrypt.hash(newPassword, salt);
+            
+            updates.push('password_hash = ?');
+            args.push(hash);
+            
+            updates.push('plain_password = ?'); // Guardamos la visible
+            args.push(newPassword);
         }
 
         if (updates.length === 0) {
@@ -1120,8 +1107,7 @@ app.post('/admin/user/update', async (req, res) => {
         res.status(200).json({
             message: 'Usuario actualizado exitosamente.',
             updatedBalance,
-            updatedRole: roleToUpdate,
-            updatedDiscount: discountToUpdate
+            updatedRole: newRole
         });
 
     } catch (error) {
@@ -1217,10 +1203,12 @@ app.post('/admin/transaction/approve', async (req, res) => {
                 // B. Determinar Porcentaje
                 let commissionRate = 0.00;
                 
+                // 🟢 CAMBIO: 15% para Distribuidor Premium
                 if (referrer.role === 'Distribuidor Premium') {
-                    commissionRate = 0.10; // 10%
+                    commissionRate = 0.15; // 15% 
+                // 🟢 CAMBIO: 10% para Distribuidor Estándar y Proveedor
                 } else if (referrer.role === 'distribuidor' || referrer.role === 'proveedor') {
-                    commissionRate = 0.05; // 5% para Distribuidor Estándar y Proveedor
+                    commissionRate = 0.10; // 10% para Distribuidor Estándar y Proveedor
                 }
                 // Si el rol es 'Usuario' o cualquier otro, commissionRate es 0.00.
 
@@ -1233,9 +1221,8 @@ app.post('/admin/transaction/approve', async (req, res) => {
                             year: 'numeric', month: '2-digit', day: '2-digit',
                             hour: '2-digit', minute: '2-digit'
                         }),
-                        // Mensaje personalizado según el porcentaje
-                        description: `Comisión ${commissionRate * 100}% por 1ra recarga de ${username}`,
-                        amount: commission,
+                        description: `Comisión (${commissionRate * 100}%): Recarga $${amountToAdd.toFixed(2)} | Comisión $${commission.toFixed(2)}`,
+                        amount: commission, // MONTO DE LA COMISIÓN CALCULADA (10% o 15%)
                         type: 'credit',
                         status: 'Completada',
                         isCommission: true,
@@ -1848,12 +1835,12 @@ app.post('/user/upgrade-to-premium', async (req, res) => {
     const numericAmount = parseFloat(amount);
     const numericMonths = parseInt(months);
 
-    if (!numericUserId || isNaN(numericAmount) || isNaN(numericMonths) || numericMonths < 1) {
+    if (!numericUserId || isNaN(numericAmount) || isNaN(numericMonths)) {
         return res.status(400).json({ message: 'Datos inválidos.' });
     }
 
     try {
-        // 1. Obtener usuario
+        // 1. Obtener usuario para ver su rol actual y saldo
         const userResult = await client.execute({
             sql: 'SELECT balance, role, premium_expires_at, transactions_history FROM users WHERE id = ?',
             args: [numericUserId]
@@ -1862,16 +1849,24 @@ app.post('/user/upgrade-to-premium', async (req, res) => {
         if (userResult.rows.length === 0) return res.status(404).json({ message: 'Usuario no encontrado.' });
         const user = userResult.rows[0];
 
-        // 2. Verificar Saldo
         if (user.balance < numericAmount) {
-            return res.status(400).json({ message: 'Saldo insuficiente para adquirir Premium.' });
+            return res.status(400).json({ message: 'Saldo insuficiente.' });
         }
 
-        // 3. Calcular Nueva Fecha de Expiración (Igual que antes)
+        // 🟢 2. DETERMINAR EL NUEVO ROL
+        let targetRole = 'Distribuidor Premium'; // Default
+        
+        // Si ya es Proveedor o Proveedor Premium, el upgrade es a Proveedor Premium
+        if (user.role === 'proveedor' || user.role === 'Proveedor Premium') {
+            targetRole = 'Proveedor Premium';
+        }
+
+        // 3. Calcular Fecha de Expiración
         let newExpirationDate;
         const now = new Date();
 
-        if (user.role === 'Distribuidor Premium' && user.premium_expires_at) {
+        // Si ya tiene el rol objetivo y fecha vigente, extendemos
+        if (user.role === targetRole && user.premium_expires_at) {
             const currentExpiry = new Date(user.premium_expires_at);
             if (currentExpiry > now) {
                 newExpirationDate = new Date(currentExpiry);
@@ -1881,57 +1876,57 @@ app.post('/user/upgrade-to-premium', async (req, res) => {
                 newExpirationDate.setMonth(newExpirationDate.getMonth() + numericMonths);
             }
         } else {
+            // Si es rol nuevo o estaba vencido, empieza hoy
             newExpirationDate = new Date();
             newExpirationDate.setMonth(newExpirationDate.getMonth() + numericMonths);
         }
 
         const formattedExpiration = newExpirationDate.toISOString().replace('T', ' ').substring(0, 19);
 
-        // 4. Registrar Transacción (CON DATOS COMPLETOS)
+        // 4. Registrar Transacción
         const newBalance = user.balance - numericAmount;
-
+        
         const transaction = {
-            id: Date.now(), // ID numérico simple
+            id: Date.now(),
             date: new Date().toLocaleDateString('es-PE'),
-            description: `Compra Membresía Distribuidor Premium (${numericMonths} mes${numericMonths > 1 ? 'es' : ''})`,
+            description: `Compra Membresía ${targetRole} (${numericMonths} mes${numericMonths > 1 ? 'es' : ''})`,
             amount: numericAmount,
             type: 'debit',
             status: 'Completada',
             details: {
                 type: 'premium_upgrade',
-                productName: 'Membresía Distribuidor Premium', // 🟢 Agregado para la tabla
-                platform: 'MeluStreaming', // 🟢 Agregado
-                planType: `${numericMonths} Mes(es)`, // 🟢 Agregado
-                provider: 'Sistema', // 🟢 Agregado
-                terms: 'Acceso a precios especiales y comisiones.', // 🟢 Agregado
+                productName: `Membresía ${targetRole}`,
+                platform: 'MeluStreaming',
+                planType: `${numericMonths} Mes(es)`,
+                provider: 'Sistema',
+                terms: 'Acceso a precios especiales y beneficios VIP.',
                 months: numericMonths,
                 expirationDate: formattedExpiration,
-                purchaseDate: new Date().toLocaleDateString('es-PE'), // 🟢 Agregado
-                cost: numericAmount // 🟢 CRÍTICO: Agregado el costo para que no falle el .toFixed(2)
+                purchaseDate: new Date().toLocaleDateString('es-PE'),
+                cost: numericAmount
             }
         };
 
         const currentHistory = JSON.parse(user.transactions_history || '[]');
         const updatedHistory = [transaction, ...currentHistory];
 
-        // 5. Actualizar Usuario en DB
+        // 5. Actualizar DB
         await client.execute({
             sql: `UPDATE users SET 
                   balance = ?, 
-                  role = 'Distribuidor Premium', 
+                  role = ?,  -- 🟢 Usamos targetRole
                   premium_expires_at = ?, 
                   transactions_history = ? 
                   WHERE id = ?`,
-            args: [newBalance, formattedExpiration, JSON.stringify(updatedHistory), numericUserId]
+            args: [newBalance, targetRole, formattedExpiration, JSON.stringify(updatedHistory), numericUserId]
         });
 
-        // 6. Notificar
         io.emit('usersUpdated');
 
         res.status(200).json({
-            message: '¡Membresía Premium activada!',
+            message: `¡Membresía ${targetRole} activada!`,
             newBalance: newBalance,
-            newRole: 'Distribuidor Premium',
+            newRole: targetRole,
             expiresAt: formattedExpiration
         });
 
