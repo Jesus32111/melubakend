@@ -1,3 +1,5 @@
+// MeluFrontend - copia/backend/db.js
+
 import { createClient } from "@libsql/client";
 import 'dotenv/config';
 import bcrypt from 'bcryptjs';
@@ -20,10 +22,11 @@ function generateRandomCode(length = 6) {
 
 /**
  * Inicializa la base de datos: crea tablas si no existen y aplica migraciones
+ * (Se mantiene IF NOT EXISTS para robustez y evitar errores al re-ejecutar)
  */
 export async function initializeDb() {
     try {
-        // 1. Tabla USERS
+        // 1. Tabla USERS (Esquema completo con todos los campos)
         await client.execute(`
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -31,6 +34,7 @@ export async function initializeDb() {
                 email TEXT UNIQUE NOT NULL,
                 phone TEXT,
                 password_hash TEXT NOT NULL,
+                plain_password TEXT,
                 referral_code TEXT,
                 role TEXT DEFAULT 'Usuario' NOT NULL,
                 transactions_history TEXT DEFAULT '[]',
@@ -45,71 +49,117 @@ export async function initializeDb() {
         `);
         console.log("✅ Database: 'users' table ready.");
 
-        // 🟢 MIGRACIÓN AUTOMÁTICA: Verificar y agregar 'plain_password' si falta
+        // 🟢 MIGRACIÓN: Verificar y agregar 'plain_password' si falta (para compatibilidad)
         try {
-            // Intentamos seleccionar la columna. Si falla, es que no existe.
-            await client.execute("SELECT plain_password FROM users LIMIT 1");
+             await client.execute("SELECT plain_password FROM users LIMIT 1");
         } catch (e) {
             console.log("🟡 Migrating: Adding 'plain_password' column to users table...");
             await client.execute("ALTER TABLE users ADD COLUMN plain_password TEXT");
             console.log("✅ Migration successful: 'plain_password' column added.");
         }
-
-        // 2. Tabla PRODUCTS
+        
+        // 2. Tabla PRODUCTS (Esquema completo usado en server.js)
         await client.execute(`
             CREATE TABLE IF NOT EXISTS products (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
+                platform TEXT,
                 description TEXT,
-                price REAL NOT NULL,
-                stock INTEGER DEFAULT 0,
-                category_id INTEGER,
-                is_available INTEGER DEFAULT 1,
+                product_details TEXT,
+                instructions TEXT,
+                is_renewable INTEGER DEFAULT 0,
+                delivery TEXT,
+                duration TEXT,
+                type TEXT,
+                price_standard REAL DEFAULT 0.00,
+                price_premium REAL DEFAULT 0.00,
+                price_renewal_standard REAL DEFAULT 0.00,
+                price_renewal_premium REAL DEFAULT 0.00,
                 image_url TEXT,
-                created_by_user_id INTEGER,
+                images TEXT,
+                stock INTEGER DEFAULT 0,
+                provider TEXT,
+                icon_name TEXT,
+                creator_user_id INTEGER,
+                is_published INTEGER DEFAULT 0,
+                publication_end_date DATETIME DEFAULT NULL,
+                is_best_seller INTEGER DEFAULT 0,
+                is_offer INTEGER DEFAULT 0,
+                is_trending INTEGER DEFAULT 0,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
         `);
         console.log("✅ Database: 'products' table ready.");
+        
+        // 3. Tabla PRODUCT_STOCK (Credenciales y Stock Detallado)
+        await client.execute(`
+            CREATE TABLE IF NOT EXISTS product_stock (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                product_id INTEGER NOT NULL,
+                provider_user_id INTEGER NOT NULL,
+                sold_to_user_id INTEGER,
+                data TEXT,
+                is_sold INTEGER DEFAULT 0,
+                sold_at DATETIME,
+                client_name TEXT,
+                client_phone TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+        `);
+        console.log("✅ Database: 'product_stock' table ready.");
 
-        // 3. Tabla CATEGORIES
+        // 4. Tabla CATEGORIES
         await client.execute(`
             CREATE TABLE IF NOT EXISTS categories (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT UNIQUE NOT NULL,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                logo_url TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                discount_premium_percentage INTEGER DEFAULT 0
             );
         `);
         console.log("✅ Database: 'categories' table ready.");
+        
+        // 🟢 MIGRACIÓN: Verificar y agregar 'discount_premium_percentage' si falta
+        try {
+            await client.execute("SELECT discount_premium_percentage FROM categories LIMIT 1");
+        } catch (e) {
+            console.log("🟡 Migrating: Adding 'discount_premium_percentage' column to categories table...");
+            await client.execute("ALTER TABLE categories ADD COLUMN discount_premium_percentage INTEGER DEFAULT 0");
+            console.log("✅ Migration successful: 'discount_premium_percentage' column added.");
+        }
 
-        // 4. Tabla PURCHASES
+
+        // 5. Tabla ORDERS (Para productos 'A pedido')
         await client.execute(`
-            CREATE TABLE IF NOT EXISTS purchases (
+            CREATE TABLE IF NOT EXISTS orders (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
+                purchase_id TEXT UNIQUE NOT NULL,
+                buyer_user_id INTEGER NOT NULL,
+                provider_user_id INTEGER NOT NULL,
                 product_id INTEGER NOT NULL,
                 quantity INTEGER NOT NULL,
                 total_price REAL NOT NULL,
-                status TEXT DEFAULT 'Pendiente' NOT NULL,
-                delivery_address TEXT,
-                purchase_date DATETIME DEFAULT CURRENT_TIMESTAMP
+                status TEXT DEFAULT 'Pending' NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
         `);
-        console.log("✅ Database: 'purchases' table ready.");
+        console.log("✅ Database: 'orders' table ready.");
 
-        // 5. Tabla WITHDRAWALS
+        // 6. Tabla WITHDRAWALS (Retiros de Proveedores)
         await client.execute(`
             CREATE TABLE IF NOT EXISTS withdrawals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
-                amount REAL NOT NULL,
-                status TEXT DEFAULT 'Pendiente' NOT NULL,
-                requested_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                amount_original REAL NOT NULL,
+                amount_final REAL NOT NULL,
+                status TEXT DEFAULT 'Pending' NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
         `);
         console.log("✅ Database: 'withdrawals' table ready.");
         
-        // 6. Tabla TRANSACTION_LOGS
+        // 7. Tabla TRANSACTION_LOGS (Mantener por si acaso)
         await client.execute(`
             CREATE TABLE IF NOT EXISTS transaction_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -121,6 +171,16 @@ export async function initializeDb() {
             );
         `);
         console.log("✅ Database: 'transaction_logs' table ready.");
+        
+        // 8. 🔑 Tabla SETTINGS (para la Tasa de Cambio y otras configs)
+        await client.execute(`
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            );
+        `);
+        console.log("✅ Database: 'settings' table ready.");
+
 
     } catch (error) {
         console.error("❌ Error initializing database:", error);
@@ -158,6 +218,19 @@ export async function seedAdminUser() {
             });
             console.log("✅ Admin user credentials updated/ensured.");
         }
+        
+        // 3. 🔑 [NUEVO] Sembrar Tasa de Cambio (Default 3.65)
+        const rateCheck = await client.execute("SELECT value FROM settings WHERE key = 'exchange_rate'");
+        if (rateCheck.rows.length === 0) {
+            await client.execute({
+                sql: "INSERT INTO settings (key, value) VALUES ('exchange_rate', ?)",
+                args: ['3.65'] 
+            });
+            console.log("✅ Settings: Initial 'exchange_rate' set to 3.65.");
+        } else {
+            console.log("✅ Settings: 'exchange_rate' already exists.");
+        }
+
     } catch (error) {
         console.error("❌ Error seeding/updating admin user:", error);
     }

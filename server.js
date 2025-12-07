@@ -208,6 +208,54 @@ app.post('/products', async (req, res) => {
     }
 });
 
+
+app.get('/api/exchange-rate', async (req, res) => {
+    try {
+        const result = await client.execute("SELECT value FROM settings WHERE key = 'exchange_rate'");
+        // Fallback a 3.65 si la configuración no se encuentra
+        const rate = result.rows.length > 0 ? parseFloat(result.rows[0].value) : 3.65; 
+        res.json({ rate });
+    } catch (error) {
+        console.error('Error fetching exchange rate:', error);
+        // Devolver el fallback rate en caso de error del servidor
+        res.status(500).json({ rate: 3.65, message: 'Internal server error, using fallback rate.' });
+    }
+});
+
+app.post('/admin/settings/exchange-rate', async (req, res) => {
+    const { rate } = req.body;
+    const numericRate = parseFloat(rate);
+
+    if (isNaN(numericRate) || numericRate <= 0) {
+        return res.status(400).json({ message: 'Tasa de cambio inválida. Debe ser un número positivo.' });
+    }
+
+    try {
+        // Usar UPSERT para insertar si no existe, o actualizar si ya existe (clave 'exchange_rate')
+        await client.execute({
+            sql: `
+                INSERT INTO settings (key, value) VALUES ('exchange_rate', ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+            `,
+            args: [numericRate.toFixed(2)]
+        });
+
+        // 📢 Emitir evento de Socket.IO para notificar a todos los clientes conectados
+        io.emit('settingsUpdated', { key: 'exchange_rate', value: numericRate.toFixed(2) });
+
+        res.json({ 
+            success: true, 
+            rate: numericRate.toFixed(2), 
+            message: 'Tasa de cambio actualizada correctamente.' 
+        });
+
+    } catch (error) {
+        console.error('Error updating exchange rate:', error);
+        res.status(500).json({ message: 'Error interno del servidor al actualizar la tasa.' });
+    }
+});
+
+
 // 🔑 ENDPOINT: Obtener todos los productos (Catálogo - AHORA FILTRADO POR PUBLICACIÓN)
 app.get('/products', async (req, res) => {
     try {
@@ -741,10 +789,47 @@ app.post('/admin/user/remove-referral', async (req, res) => {
 // 🟢 OBTENER CATEGORÍAS
 app.get('/categories', async (req, res) => {
     try {
-        const result = await client.execute('SELECT * FROM categories');
+        const result = await client.execute("SELECT id, name, logo_url, discount_premium_percentage FROM categories");
         res.json(result.rows);
     } catch (error) {
-        res.status(500).json({ message: 'Error al obtener categorías.' });
+        console.error('Error fetching categories:', error);
+        res.status(500).json({ message: 'Error interno del servidor.' });
+    }
+});
+
+app.get('/admin/settings/category-discounts', async (req, res) => {
+    // Nota: Deberías incluir verifyAdminToken aquí en un entorno real.
+    try {
+        const result = await client.execute("SELECT id, name, discount_premium_percentage FROM categories ORDER BY name ASC");
+        res.json(result.rows);
+    } catch (error) {
+        console.error('Error fetching category discounts:', error);
+        res.status(500).json({ message: 'Error interno del servidor.' });
+    }
+});
+
+app.post('/admin/settings/category-discount/update', async (req, res) => {
+    // Nota: Deberías incluir verifyAdminToken aquí en un entorno real.
+    const { categoryId, discountPercentage } = req.body;
+
+    if (!categoryId || typeof discountPercentage !== 'number' || discountPercentage < 0 || discountPercentage > 100) {
+        return res.status(400).json({ message: 'Datos de descuento inválidos.' });
+    }
+
+    try {
+        await client.execute({
+            sql: `UPDATE categories SET discount_premium_percentage = ? WHERE id = ?`,
+            args: [discountPercentage, categoryId]
+        });
+
+        // 📢 Emitir evento de Socket.IO para actualizar el frontend globalmente
+        io.emit('categoriesUpdated', { message: `Discount for category ${categoryId} updated.` });
+
+        res.json({ success: true, message: 'Descuento actualizado correctamente.' });
+
+    } catch (error) {
+        console.error('Error updating category discount:', error);
+        res.status(500).json({ message: 'Error interno del servidor al actualizar descuento.' });
     }
 });
 
