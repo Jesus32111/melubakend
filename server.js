@@ -1789,10 +1789,12 @@ app.post('/user/purchase', async (req, res) => {
         const user = userResult.rows[0];
         if (user.balance < numericAmount) return res.status(400).json({ message: 'Saldo insuficiente.' });
 
+        // 🟢 CORRECCIÓN: Se agregó 'provider' a la lista de columnas seleccionadas
         const productResult = await client.execute({
-            sql: 'SELECT id, stock, duration, delivery, creator_user_id, product_details, instructions, is_renewable, price_renewal_standard, price_renewal_premium FROM products WHERE name = ? AND platform = ? LIMIT 1',
+            sql: 'SELECT id, stock, duration, delivery, creator_user_id, product_details, instructions, is_renewable, price_renewal_standard, price_renewal_premium, provider FROM products WHERE name = ? AND platform = ? LIMIT 1',
             args: [productName, platform]
         });
+        
         if (productResult.rows.length === 0) return res.status(404).json({ message: 'Producto no encontrado.' });
         const product = productResult.rows[0];
         const productId = product.id;
@@ -1851,11 +1853,25 @@ app.post('/user/purchase', async (req, res) => {
             type: 'debit',
             status: 'Completada',
             details: {
-                productName, platform, planType: type, provider: product.provider, duration: product.duration, terms, cost: numericAmount,
-                fullCredentials: credentialsList, purchaseDate: new Date().toLocaleDateString('es-PE'), expirationDate: expDate.toLocaleDateString('es-PE'),
-                delivery: isOrderRequest ? 'A pedido' : 'Autoentrega', quantity: numericQty, productDetails: product.product_details, instructions: product.instructions,
-                isRenewable: product.is_renewable === 1, priceRenewalStandard: product.price_renewal_standard || 0, priceRenewalPremium: product.price_renewal_premium || 0,
-                priceSoldPerUnit: numericFinalPricePerUnit, priceSoldTotal: numericAmount
+                productName, 
+                platform, 
+                planType: type, 
+                provider: product.provider, // 🟢 Ahora sí tendrá valor porque se incluyó en el SELECT
+                duration: product.duration, 
+                terms, 
+                cost: numericAmount,
+                fullCredentials: credentialsList, 
+                purchaseDate: new Date().toLocaleDateString('es-PE'), 
+                expirationDate: expDate.toLocaleDateString('es-PE'),
+                delivery: isOrderRequest ? 'A pedido' : 'Autoentrega', 
+                quantity: numericQty, 
+                productDetails: product.product_details, 
+                instructions: product.instructions,
+                isRenewable: product.is_renewable === 1, 
+                priceRenewalStandard: product.price_renewal_standard || 0, 
+                priceRenewalPremium: product.price_renewal_premium || 0,
+                priceSoldPerUnit: numericFinalPricePerUnit, 
+                priceSoldTotal: numericAmount
             }
         };
         
@@ -1898,7 +1914,6 @@ app.post('/user/purchase', async (req, res) => {
             io.to(targetSocketId).emit('transactionApproved', { transactionId: newBuyerTransaction.id, amount: numericAmount, message: `¡Tu compra de ${productName} ha sido completada!` });
         }
 
-        // 🟢 FIX: Enviamos las fechas en la respuesta raíz para que el modal de entrega las reciba
         res.status(200).json({ 
             message: 'Compra realizada.', 
             newBalance: buyerNewBalance.toFixed(2), 
@@ -3394,6 +3409,151 @@ app.post('/user/support/approve', async (req, res) => {
     }
 });
 
+app.get('/fix-old-tickets', async (req, res) => {
+    try {
+        console.log("🛠️ Iniciando reparación de tickets de soporte...");
+        const usersRes = await client.execute("SELECT id, username, transactions_history FROM users");
+        let totalFixed = 0;
+
+        for (const user of usersRes.rows) {
+            let history = JSON.parse(user.transactions_history || '[]');
+            let modified = false;
+
+            for (let tx of history) {
+                // Buscamos compras (debit) que NO tengan el campo provider
+                if (tx.type === 'debit' && tx.details && !tx.details.provider) {
+                    
+                    let foundProvider = null;
+
+                    // ESTRATEGIA 1: Buscar por el Producto original en la base de datos
+                    if (tx.details.productName) {
+                        const prodRes = await client.execute({
+                            sql: "SELECT u.username FROM products p JOIN users u ON p.creator_user_id = u.id WHERE p.name = ? LIMIT 1",
+                            args: [tx.details.productName]
+                        });
+                        if (prodRes.rows.length > 0) {
+                            foundProvider = prodRes.rows[0].username;
+                        }
+                    }
+
+                    // ESTRATEGIA 2: Si tiene ID de stock, buscar quién subió ese stock
+                    if (!foundProvider && tx.details.fullCredentials && tx.details.fullCredentials.length > 0) {
+                        const stockId = tx.details.fullCredentials[0].stockId;
+                        if (stockId) {
+                            const stockRes = await client.execute({
+                                sql: "SELECT u.username FROM product_stock ps JOIN users u ON ps.provider_user_id = u.id WHERE ps.id = ?",
+                                args: [stockId]
+                            });
+                            if (stockRes.rows.length > 0) foundProvider = stockRes.rows[0].username;
+                        }
+                    }
+
+                    // Si encontramos al proveedor, actualizamos la transacción histórica
+                    if (foundProvider) {
+                        tx.details.provider = foundProvider; // Asignamos el proveedor faltante
+                        modified = true;
+                        totalFixed++;
+                    }
+                }
+            }
+
+            if (modified) {
+                await client.execute({
+                    sql: "UPDATE users SET transactions_history = ? WHERE id = ?",
+                    args: [JSON.stringify(history), user.id]
+                });
+            }
+        }
+
+        io.emit('transactionsUpdated'); // Actualizar frontend
+        res.json({ success: true, message: `Se repararon ${totalFixed} transacciones antiguas. Ahora deberían ser visibles.` });
+
+    } catch (error) {
+        console.error("Error en reparación:", error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.get('/fix-broken-transactions', async (req, res) => {
+    try {
+        console.log("🛠️ Iniciando reparación de transacciones...");
+        const usersRes = await client.execute("SELECT id, username, transactions_history FROM users");
+        let totalFixed = 0;
+
+        for (const user of usersRes.rows) {
+            let history = JSON.parse(user.transactions_history || '[]');
+            let modified = false;
+
+            for (let tx of history) {
+                // Solo reparamos compras (debit) que NO tengan proveedor o sea null
+                if (tx.type === 'debit' && tx.details && (!tx.details.provider || tx.details.provider === 'MeluStreaming')) {
+                    
+                    let foundProvider = null;
+
+                    // ESTRATEGIA 1: Buscar por ID de Stock (Si es entrega automática)
+                    if (tx.details.fullCredentials && tx.details.fullCredentials.length > 0) {
+                        const stockId = tx.details.fullCredentials[0].stockId;
+                        if (stockId) {
+                            const stockRes = await client.execute({
+                                sql: "SELECT u.username FROM product_stock ps JOIN users u ON ps.provider_user_id = u.id WHERE ps.id = ?",
+                                args: [stockId]
+                            });
+                            if (stockRes.rows.length > 0) foundProvider = stockRes.rows[0].username;
+                        }
+                    }
+
+                    // ESTRATEGIA 2: Buscar por Tabla de Órdenes (Si fue "A pedido")
+                    if (!foundProvider) {
+                        const orderRes = await client.execute({
+                            sql: "SELECT u.username FROM orders o JOIN users u ON o.provider_user_id = u.id WHERE o.purchase_id = ?",
+                            args: [tx.id]
+                        });
+                        if (orderRes.rows.length > 0) foundProvider = orderRes.rows[0].username;
+                    }
+
+                    // ESTRATEGIA 3: Buscar por Nombre de Producto (Fallback - Asume el creador del producto)
+                    if (!foundProvider && tx.details.productName) {
+                        const prodRes = await client.execute({
+                            sql: "SELECT u.username FROM products p JOIN users u ON p.creator_user_id = u.id WHERE p.name = ? LIMIT 1",
+                            args: [tx.details.productName]
+                        });
+                        if (prodRes.rows.length > 0) foundProvider = prodRes.rows[0].username;
+                    }
+
+                    // APLICAR CORRECCIÓN
+                    if (foundProvider) {
+                        console.log(`🔧 Reparando Tx ${tx.id} de ${user.username}: Proveedor asignado -> ${foundProvider}`);
+                        tx.details.provider = foundProvider;
+                        modified = true;
+                        totalFixed++;
+                    }
+                }
+            }
+
+            if (modified) {
+                await client.execute({
+                    sql: "UPDATE users SET transactions_history = ? WHERE id = ?",
+                    args: [JSON.stringify(history), user.id]
+                });
+            }
+        }
+
+        console.log(`✅ Reparación completada. Total corregidas: ${totalFixed}`);
+        
+        // Notificar al frontend para que refresque
+        io.emit('transactionsUpdated');
+        
+        res.json({ 
+            success: true, 
+            message: `Reparación completada. Se corrigieron ${totalFixed} transacciones.`,
+            fixedCount: totalFixed 
+        });
+
+    } catch (error) {
+        console.error("Error en script de reparación:", error);
+        res.status(500).json({ error: error.message });
+    }
+});
 // Inicializar DB, sembrar Admin y arrancar servidor
 initializeDb()
     .then(seedAdminUser)
