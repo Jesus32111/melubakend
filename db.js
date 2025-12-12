@@ -231,6 +231,18 @@ export async function seedAdminUser() {
             console.log("✅ Settings: 'exchange_rate' already exists.");
         }
 
+        // 4. 🔑 [NUEVO] Sembrar Tasa de Comisión de Retiro (Default 0.10)
+        const feeCheck = await client.execute("SELECT value FROM settings WHERE key = 'withdrawal_fee'");
+        if (feeCheck.rows.length === 0) {
+            await client.execute({
+                sql: "INSERT INTO settings (key, value) VALUES ('withdrawal_fee', ?)",
+                args: ['0.10'] 
+            });
+            console.log("✅ Settings: Initial 'withdrawal_fee' set to 0.10 (10%).");
+        } else {
+            console.log("✅ Settings: 'withdrawal_fee' already exists.");
+        }
+
     } catch (error) {
         console.error("❌ Error seeding/updating admin user:", error);
     }
